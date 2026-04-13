@@ -1,0 +1,157 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Lending.LoanOffer where
+
+import DA.Date (Date, addDays, toDateUTC)
+import DA.Optional (isSome)
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Text ((<>), partyToText)
+import DA.Time (Time)
+import Daml.Finance.Interface.Types.Common.Types (Account, Id)
+import Lending.Loan (LoanProposal)
+
+-- | Represents a lender's offer to provide a fixed-rate loan.
+-- This contract is typically created by a lender and can be disclosed to potential borrowers.
+-- A borrower can then accept a portion or all of the offered amount, which initiates a
+-- loan proposal workflow.
+template LoanOffer
+  with
+    lender : Party
+      -- ^ The party offering to lend the principal. Signatory of this contract.
+    operator : Party
+      -- ^ The operator of the lending platform, an observer on all offers.
+    offerId : Text
+      -- ^ A unique identifier for this offer, provided by the lender.
+    currency : Text
+      -- ^ The currency of the loan principal (e.g., "USD").
+    collateralType : Text
+      -- ^ The asset required as collateral (e.g., "USTB" for tokenized T-Bills).
+    interestRate : Decimal
+      -- ^ The fixed annual interest rate (e.g., 0.05 for 5% APR).
+    termDays : Int
+      -- ^ The duration of the loan in days.
+    maturityDate : Date
+      -- ^ The calculated date when the loan principal and interest are due.
+    collateralRatio : Decimal
+      -- ^ The required collateralization ratio (e.g., 1.25 for 125%).
+    minLoanAmount : Decimal
+      -- ^ The minimum principal amount a borrower can request from this offer.
+    maxLoanAmount : Decimal
+      -- ^ The total initial amount the lender is willing to lend under this offer.
+    remainingAmount : Decimal
+      -- ^ The amount currently available to be borrowed from this offer.
+    createdAt : Time
+      -- ^ The timestamp of when the offer was created.
+    viewers : Set Party
+      -- ^ The set of parties who are permitted to view and accept this offer.
+  where
+    signatory lender
+    observer operator, viewers
+
+    key (lender, offerId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      let creationDate = toDateUTC createdAt
+      in
+        minLoanAmount > 0.0 &&
+        maxLoanAmount >= minLoanAmount &&
+        remainingAmount > 0.0 &&
+        remainingAmount <= maxLoanAmount &&
+        interestRate >= 0.0 &&
+        collateralRatio > 0.0 &&
+        termDays > 0 &&
+        -- Ensure maturity date is consistent with term and creation time.
+        maturityDate == addDays creationDate termDays &&
+        -- Ensure the lender and operator are always in the viewers set.
+        Set.member lender viewers &&
+        Set.member operator viewers
+
+    -- | Allows the lender to disclose this offer to a new potential borrower, adding them
+    -- to the `viewers` set. This is a privacy-preserving mechanism.
+    choice Disclose : ContractId LoanOffer
+      with
+        newViewer : Party
+      controller lender
+      do
+        assertMsg "The specified party is already a viewer of this offer." $
+          not $ Set.member newViewer viewers
+        create this with viewers = Set.insert newViewer viewers
+
+    -- | Allows the lender to withdraw the offer from the market. This is only possible
+    -- if no portion of the loan has been accepted yet.
+    choice Withdraw : ()
+      controller lender
+      do
+        assertMsg "Offer cannot be withdrawn as it has been partially accepted." $
+          remainingAmount == maxLoanAmount
+        return ()
+
+    -- | Allows a permitted borrower to accept a portion of the available loan amount.
+    -- This action archives the current offer and creates a `LoanProposal`.
+    -- If a portion of the original offer remains, a new `LoanOffer` is created for
+    -- the remaining amount.
+    choice Accept : (ContractId LoanProposal, Optional (ContractId LoanOffer))
+      with
+        borrower : Party
+          -- ^ The party accepting the loan offer.
+        borrowAmount : Decimal
+          -- ^ The amount of principal the borrower wishes to borrow.
+        borrowerPrincipalAccount : Account
+          -- ^ The account where the borrower will receive the loan principal.
+        borrowerCollateralAccount : Account
+          -- ^ The account from which the borrower will post collateral.
+        loanProposalId : Text
+          -- ^ A unique ID for the resulting `LoanProposal` contract.
+        remainderOfferId : Optional Text
+          -- ^ If the offer is partially filled, this ID will be used for the new
+          -- `LoanOffer` representing the remainder.
+      controller borrower
+      do
+        -- Authorization: Only a designated viewer (not the lender) can accept.
+        assertMsg "Accepting party must be a viewer of the offer." $ Set.member borrower viewers
+        assertMsg "Lender cannot accept their own offer." $ borrower /= lender
+
+        -- Validation: Requested amount must be within the offer's limits.
+        assertMsg ("Borrow amount must be at least the minimum of " <> show minLoanAmount) $
+          borrowAmount >= minLoanAmount
+        assertMsg ("Borrow amount cannot exceed the available " <> show remainingAmount) $
+          borrowAmount <= remainingAmount
+
+        let newRemainingAmount = remainingAmount - borrowAmount
+
+        -- If a remainder offer will be created, an ID for it must be provided.
+        when (newRemainingAmount >= minLoanAmount) $
+          assertMsg "A new offer ID must be provided for the remaining amount." $
+            isSome remainderOfferId
+
+        -- Create the loan proposal, which the lender will need to fund.
+        proposalCid <- create LoanProposal with
+          lender
+          borrower
+          operator
+          proposalId = loanProposalId
+          currency
+          principalAmount = borrowAmount
+          collateralType
+          -- The required collateral is calculated based on the borrow amount and ratio.
+          requiredCollateralAmount = borrowAmount * collateralRatio
+          interestRate
+          termDays
+          maturityDate
+          borrowerPrincipalAccount
+          borrowerCollateralAccount
+
+        -- If there's a significant amount remaining, create a new offer for it.
+        remainingOfferCid <- if newRemainingAmount >= minLoanAmount then
+          case remainderOfferId of
+            None -> error "IMPOSSIBLE: Remainder offer ID presence already asserted."
+            Some newId -> fmap Some $ create this with
+              offerId = newId
+              remainingAmount = newRemainingAmount
+        else
+          return None
+
+        return (proposalCid, remainingOfferCid)
