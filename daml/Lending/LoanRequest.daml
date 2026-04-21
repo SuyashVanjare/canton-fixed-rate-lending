@@ -1,0 +1,160 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Lending.LoanRequest where
+
+import Daml.Script
+
+import DA.Date as D
+import DA.Date.Types (Date)
+import DA.Time (Time, addRelTime, getTime)
+import DA.Conversion (intToDecimal)
+
+import Lending.Types (AssetId, InterestRate, LoanId)
+import Lending.Asset (Asset)
+import Lending.LoanOffer (LoanOffer)
+import Lending.LoanAgreement (LoanAgreement)
+
+-- | Represents a borrower's request for a fixed-rate loan against specified collateral.
+-- This contract is created by a borrower and observed by the operator, who facilitates matching.
+-- It serves as one half of a potential loan agreement, waiting for a compatible `LoanOffer`.
+template LoanRequest
+  with
+    borrower          : Party
+      -- ^ The party requesting to borrow funds.
+    operator          : Party
+      -- ^ The operator of the lending platform, responsible for matching offers and requests.
+    loanId            : LoanId
+      -- ^ A unique identifier for the request, provided by the borrower for idempotency.
+    loanAmount        : Decimal
+      -- ^ The principal amount the borrower wishes to receive.
+    loanCurrency      : Text
+      -- ^ The currency of the loan principal (e.g., "USD").
+    collateralAmount  : Decimal
+      -- ^ The quantity of collateral offered.
+    collateralAssetId : AssetId
+      -- ^ An identifier for the collateral asset (e.g., ISIN for a T-Bill).
+    collateralCid     : ContractId Asset
+      -- ^ The contract holding the borrower's collateral to be locked for the loan.
+    maxInterestRate   : InterestRate
+      -- ^ The maximum annualized interest rate the borrower is willing to pay.
+    termDays          : Int
+      -- ^ The loan term in days.
+    expiryTime        : Time
+      -- ^ The time at which this request expires and can be removed from the order book.
+  where
+    signatory borrower
+    observer operator
+
+    key (borrower, operator, loanId) : (Party, Party, LoanId)
+    maintainer key._1
+
+    ensure
+      loanAmount > 0.0 &&
+      collateralAmount > 0.0 &&
+      maxInterestRate >= 0.0 &&
+      termDays > 0
+
+    -- | The borrower can withdraw their loan request at any time before it is matched.
+    -- This archives the contract, effectively removing it from the order book.
+    choice Withdraw : ()
+      controller borrower
+      do
+        return ()
+
+    -- | The operator can remove an expired loan request from the book. This is a housekeeping
+    -- | function to maintain the order book's integrity.
+    choice Expire : ()
+      controller operator
+      do
+        now <- getTime
+        assertMsg "Loan request has not expired yet" (now >= expiryTime)
+        return ()
+
+    -- | This choice is exercised by the `operator` to finalize a match with a `LoanOffer`.
+    -- It verifies the compatibility of the two contracts and, if successful, creates
+    -- a `LoanAgreement`, consuming both the request and the offer in the same transaction.
+    choice AcceptOffer : ContractId LoanAgreement
+      controller operator
+      with
+        loanOfferCid : ContractId LoanOffer
+          -- ^ The `LoanOffer` contract that has been matched with this request.
+      do
+        -- Fetch the corresponding offer.
+        offer <- fetch loanOfferCid
+
+        -- Assert that the terms of the offer are compatible with this request.
+        -- This ensures the integrity of the match.
+        assertMsg "Loan amounts do not match" (self.loanAmount == offer.loanAmount)
+        assertMsg "Loan currencies do not match" (self.loanCurrency == offer.loanCurrency)
+        assertMsg "Loan terms do not match" (self.termDays == offer.termDays)
+        assertMsg "Collateral amounts do not match" (self.collateralAmount == offer.collateralAmount)
+        assertMsg "Collateral asset IDs do not match" (self.collateralAssetId == offer.collateralAssetId)
+        assertMsg "Offered interest rate is higher than borrower's maximum rate" (self.maxInterestRate >= offer.interestRate)
+
+        -- The offer itself must not have expired.
+        now <- getTime
+        assertMsg "The matched loan offer has expired" (now < offer.expiryTime)
+
+        -- If all checks pass, create the final loan agreement.
+        -- The interest rate is set to the offer's rate, which benefits the borrower if it's
+        -- lower than their specified maximum rate.
+        let
+          issuanceDate = D.toDateUTC now
+          maturityDate = D.addDays issuanceDate self.termDays
+          -- Simple interest calculation for the repayment amount.
+          repaymentAmount = self.loanAmount * (1.0 + offer.interestRate * (intToDecimal self.termDays / 365.0))
+
+        create LoanAgreement with
+          borrower = self.borrower
+          lender = offer.lender
+          operator = self.operator
+          loanId = self.loanId
+          principalAmount = self.loanAmount
+          principalCurrency = self.loanCurrency
+          repaymentAmount
+          interestRate = offer.interestRate
+          collateralAmount = self.collateralAmount
+          collateralAssetId = self.collateralAssetId
+          issuanceDate
+          maturityDate
+          -- The CIDs for principal and collateral are passed to the agreement to be
+          -- handled in a subsequent settlement step (e.g., DvP).
+          principalCid = offer.principalCid
+          collateralCid = self.collateralCid
+
+
+-- | A Daml Script to demonstrate the creation of a `LoanRequest` contract.
+-- This can be used for testing and setting up initial ledger states.
+setup_LoanRequest : Script (ContractId LoanRequest)
+setup_LoanRequest = script do
+  -- 1. Allocate parties for the scenario.
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "borrower")
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+
+  -- 2. Create a mock collateral asset for the borrower.
+  -- In a real application, this asset would be issued by a trusted third party.
+  collateralCid <- submit borrower do
+    create Asset with
+      issuer = borrower
+      owner = borrower
+      assetId = "US-T-BILL-912797J49" -- Example ISIN for a US Treasury Bill
+      quantity = 1_010_000.0
+
+  -- 3. The borrower submits the loan request to the ledger.
+  now <- getTime
+  let
+    request = LoanRequest with
+      borrower
+      operator
+      loanId = "REQ-2024-05-001"
+      loanAmount = 1_000_000.0
+      loanCurrency = "USD"
+      collateralAmount = 1_010_000.0
+      collateralAssetId = "US-T-BILL-912797J49"
+      collateralCid
+      maxInterestRate = 0.0525 -- 5.25%
+      termDays = 90
+      expiryTime = addRelTime now (24.0 * 60.0 * 60.0) -- Expires in 24 hours
+
+  submit borrower do create request
