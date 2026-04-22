@@ -1,0 +1,223 @@
+module Test.LendingTest where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time as Time
+import DA.Assert
+import DA.Optional (fromSome)
+
+import Lending.LoanRequest
+import Lending.LoanAgreement
+import Lending.CollateralVault
+import Lending.InterestAccrual
+import Lending.Repayment
+
+-- Mock token for testing purposes. In a real scenario, this would be a CIP-0056 compliant token.
+template MockToken
+  with
+    owner: Party
+    issuer: Party
+    symbol: Text
+    quantity: Decimal
+  where
+    signatory issuer, owner
+
+    choice Transfer : ContractId MockToken
+      with
+        newOwner: Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+setupParties = script do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "borrower")
+  lender <- allocatePartyWithHint "Lender" (PartyIdHint "lender")
+  return (operator, borrower, lender)
+
+lendingTests = script do
+  (operator, borrower, lender) <- setupParties
+
+  test "Full successful loan lifecycle: request, offer, agreement, accrual, repayment, withdrawal" do
+    -- 1. SETUP
+    currentTime <- getTime
+    let
+      issueTime = currentTime
+      maturityDate = Date.addDays (Date.toDateUTC currentTime) 30
+      maturityTime = Time.time (Date.fromGregorian 2024 Nov 1) 0 0 0 -- Arbitrary future date for maturity
+      collateralSymbol = "TBILL"
+      borrowSymbol = "USDC"
+      loanAmount = 1_000_000.0
+      collateralAmount = 1_200_000.0
+      -- 5% annual rate
+      interestRate = 0.05
+      repaymentAmount = loanAmount * (1.0 + interestRate * (30.0 / 360.0)) -- Simple interest for 30 days
+
+    -- Issue mock tokens
+    collateralTokenCid <- submit borrower do
+      createCmd MockToken with issuer = borrower, owner = borrower, symbol = collateralSymbol, quantity = collateralAmount
+    borrowAssetTokenCid <- submit lender do
+      createCmd MockToken with issuer = lender, owner = lender, symbol = borrowSymbol, quantity = loanAmount
+
+    -- 2. BORROWER REQUESTS LOAN
+    -- Borrower first creates a vault and deposits collateral
+    vaultCid <- submit borrower do
+      createCmd CollateralVault with
+        owner = borrower
+        operator
+        collateral = collateralTokenCid
+        locked = False
+        loanAgreementCid = None
+
+    -- Borrower creates the loan request, referencing the vault
+    requestCid <- submit borrower do
+      createCmd LoanRequest with
+        borrower
+        operator
+        borrowAmount = loanAmount
+        borrowAssetSymbol = borrowSymbol
+        interestRate
+        maturityDate
+        collateralAmount
+        collateralAssetSymbol = collateralSymbol
+        collateralVaultCid = vaultCid
+
+    -- 3. LENDER OFFERS TO FUND
+    -- Lender accepts the request, which atomically creates the loan agreement
+    (loanAgreementCid, _receipt) <- submit lender do
+      exerciseCmd requestCid Offer with lender, lenderFundCid = borrowAssetTokenCid
+
+    -- Verify the loan agreement and vault state
+    loanAgreement <- fromSome <$> queryContractId lender loanAgreementCid
+    loanAgreement.borrower === borrower
+    loanAgreement.lender === lender
+    loanAgreement.outstandingPrincipal === loanAmount
+
+    vault <- fromSome <$> queryContractId lender (loanAgreement.collateralVaultCid)
+    vault.locked === True
+    vault.loanAgreementCid === Some loanAgreementCid
+
+    -- Verify borrower received funds
+    borrowerTokens <- queryContracts @MockToken borrower
+    let receivedFunds = filter (\c -> c.payload.symbol == borrowSymbol) borrowerTokens
+    length receivedFunds === 1
+    (head receivedFunds).payload.quantity === loanAmount
+
+    -- 4. INTEREST ACCRUAL
+    -- Simulate time passing for interest calculation
+    let accrualTime = Time.addRelTime issueTime (days 15)
+    passTime (convertRelTimeToMicroseconds $ days 15)
+
+    -- Operator (or lender) triggers interest accrual
+    updatedLoanAgreementCid <- submit operator do
+      exerciseCmd loanAgreementCid AccrueInterest with observationTime = accrualTime
+
+    -- Verify interest has been accrued and added to principal
+    updatedLoanAgreement <- fromSome <$> queryContractId lender updatedLoanAgreementCid
+    updatedLoanAgreement.accruedInterest > 0.0
+    updatedLoanAgreement.outstandingPrincipal > loanAmount
+    debug $ "Outstanding Principal after accrual: " <> show updatedLoanAgreement.outstandingPrincipal
+
+    -- 5. BORROWER REPAYS LOAN
+    -- Setup repayment funds for borrower
+    repaymentTokenCid <- submit borrower do
+      createCmd MockToken with
+        issuer = borrower,
+        owner = borrower,
+        symbol = borrowSymbol,
+        quantity = updatedLoanAgreement.outstandingPrincipal + updatedLoanAgreement.accruedInterest
+
+    -- Borrower repays the full outstanding amount
+    receiptCid <- submit borrower do
+      exerciseCmd updatedLoanAgreementCid Repay with repaymentTokenCid
+
+    -- Verify agreement is archived and receipt is created
+    queryContractId @LoanAgreement borrower updatedLoanAgreementCid === None
+    repaymentReceipt <- fromSome <$> queryContractId borrower receiptCid
+    repaymentReceipt.borrower === borrower
+    repaymentReceipt.lender === lender
+
+    -- 6. BORROWER WITHDRAWS COLLATERAL
+    -- Vault should now be unlocked
+    unlockedVault <- fromSome <$> queryContractId borrower vaultCid
+    unlockedVault.locked === False
+
+    -- Borrower withdraws
+    (withdrawnTokenCid, _collateralReceipt) <- submit borrower do
+      exerciseCmd vaultCid WithdrawCollateral
+
+    -- Verify collateral token is back with borrower
+    withdrawnToken <- fromSome <$> queryContractId borrower withdrawnTokenCid
+    withdrawnToken.owner === borrower
+    withdrawnToken.symbol === collateralSymbol
+
+    -- Vault should be archived
+    queryContractId @CollateralVault borrower vaultCid === None
+    return ()
+
+
+  test "Loan default and collateral liquidation" do
+    -- 1. SETUP (same as happy path until agreement creation)
+    currentTime <- getTime
+    let
+      maturityDate = Date.addDays (Date.toDateUTC currentTime) 10
+      collateralSymbol = "TBILL-DFT"
+      borrowSymbol = "USDC-DFT"
+      loanAmount = 500_000.0
+      collateralAmount = 750_000.0
+      interestRate = 0.08
+
+    collateralTokenCid <- submit borrower do
+      createCmd MockToken with issuer = borrower, owner = borrower, symbol = collateralSymbol, quantity = collateralAmount
+    borrowAssetTokenCid <- submit lender do
+      createCmd MockToken with issuer = lender, owner = lender, symbol = borrowSymbol, quantity = loanAmount
+
+    vaultCid <- submit borrower do
+      createCmd CollateralVault with owner = borrower, operator, collateral = collateralTokenCid, locked = False, loanAgreementCid = None
+    requestCid <- submit borrower do
+      createCmd LoanRequest with
+        borrower, operator, borrowAmount = loanAmount, borrowAssetSymbol = borrowSymbol, interestRate,
+        maturityDate, collateralAmount, collateralAssetSymbol = collateralSymbol, collateralVaultCid = vaultCid
+
+    (loanAgreementCid, _) <- submit lender do
+      exerciseCmd requestCid Offer with lender, lenderFundCid = borrowAssetTokenCid
+
+    -- 2. SIMULATE TIME PASSING BEYOND MATURITY
+    passTime (convertRelTimeToMicroseconds $ days 11)
+    let postMaturityTime = Time.addRelTime currentTime (days 11)
+
+    -- 3. LENDER DECLARES DEFAULT
+    defaultedLoanCid <- submit lender do
+      exerciseCmd loanAgreementCid DeclareDefault with asOf = postMaturityTime
+
+    -- Verify state transition
+    queryContractId @LoanAgreement lender loanAgreementCid === None
+    defaultedLoan <- fromSome <$> queryContractId lender defaultedLoanCid
+    defaultedLoan.lender === lender
+    defaultedLoan.borrower === borrower
+    defaultedLoan.status === "Defaulted"
+
+    -- 4. LENDER LIQUIDATES COLLATERAL
+    liquidationReceiptCid <- submit lender do
+      exerciseCmd defaultedLoanCid LiquidateCollateral
+
+    -- Verify outcome
+    queryContractId @DefaultedLoan lender defaultedLoanCid === None
+    liquidationReceipt <- fromSome <$> queryContractId lender liquidationReceiptCid
+    liquidationReceipt.liquidator === lender
+
+    -- The vault contract should be gone
+    queryContractId @CollateralVault lender vaultCid === None
+
+    -- The collateral token should now be owned by the lender
+    lenderTokens <- queryContracts @MockToken lender
+    let seizedCollateral = filter (\c -> c.payload.symbol == collateralSymbol) lenderTokens
+    length seizedCollateral === 1
+    (head seizedCollateral).payload.quantity === collateralAmount
+
+    -- The borrower should have no access to the collateral
+    borrowerCollateral <- queryContracts @MockToken borrower
+    let borrowerCollateral' = filter (\c -> c.payload.symbol == collateralSymbol) borrowerCollateral
+    length borrowerCollateral' === 0
+
+    return ()
