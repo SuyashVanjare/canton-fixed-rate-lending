@@ -1,0 +1,92 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Lending.Repayment where
+
+import DA.Date (Date)
+import DA.Assert ((assertMsg))
+
+import Lending.LoanAgreement (LoanAgreement)
+import Lending.CollateralVault (CollateralVault(..))
+
+-- To represent the repayment asset, we assume a generic fungible asset contract
+-- that follows a common pattern, such as the one defined in `daml-finance` or the
+-- Canton token standard CIP-0056.
+-- For simplicity and to keep this module self-contained, we define an interface
+-- to represent the necessary settlement mechanism, which would typically be an
+-- `Allocation`. In a production system, this would be replaced with an import
+-- of a standard token library.
+interface FungibleAllocation
+  with
+    assetOwner: Party
+    assetReceiver: Party
+    amount: Decimal
+  where
+    viewtype FungibleAllocationView = FungibleAllocationView with ..
+    choice Settle: ()
+      controller assetOwner, assetReceiver
+      do return ()
+
+-- | Represents the borrower's obligation to repay a loan at maturity.
+-- This contract is typically created upon the consummation of a `LoanAgreement`.
+-- It orchestrates the final settlement: the borrower pays the principal plus
+-- interest, and in the same atomic transaction, the collateral is released
+-- from the `CollateralVault`.
+template Repayment
+  with
+    borrower: Party
+      -- ^ The party obligated to repay the loan.
+    lender: Party
+      -- ^ The party receiving the repayment.
+    operator: Party
+      -- ^ The operator of the lending platform.
+    loanAgreementId: ContractId LoanAgreement
+      -- ^ The original loan agreement being settled.
+    collateralVaultId: ContractId CollateralVault
+      -- ^ The vault holding the borrower's collateral to be released upon repayment.
+    repaymentAmount: Decimal
+      -- ^ The total amount due, i.e., principal + total accrued interest.
+    currency: Text
+      -- ^ The currency of the repayment amount (e.g., "USD").
+    dueDate: Date
+      -- ^ The final date by which the repayment must be made.
+  where
+    signatory borrower, operator
+    observer lender
+
+    ensure repaymentAmount > 0.0
+
+    -- | Allows the borrower to settle the loan by providing a payment allocation.
+    -- This choice performs an atomic delivery-versus-payment (DvP) style settlement.
+    -- The borrower's payment is settled, and the lender-controlled collateral vault
+    -- is simultaneously instructed to release the collateral back to the borrower.
+    -- This choice consumes the `Repayment` contract.
+    nonconsuming choice SettleRepayment: ()
+      with
+        paymentAllocationCid: ContractId FungibleAllocation
+          -- ^ A contract ID for an allocation of the repayment asset,
+          -- owned by the borrower and designated for the lender.
+      controller borrower
+      do
+        -- Fetch the payment allocation and verify its terms match the repayment obligation.
+        paymentAllocation <- fetch paymentAllocationCid
+        let allocationView = view paymentAllocation
+
+        assertMsg "Payment allocation must be owned by the borrower." $
+          allocationView.assetOwner == borrower
+        assertMsg "Payment allocation must be designated for the lender." $
+          allocationView.assetReceiver == lender
+        assertMsg "Repayment amount does not match allocation amount." $
+          allocationView.amount == repaymentAmount
+
+        -- Atomically settle the payment and release the collateral.
+        -- 1. Settle the payment from borrower to lender.
+        exercise paymentAllocationCid Settle
+
+        -- 2. Release collateral from the vault back to the borrower.
+        exercise collateralVaultId ReleaseCollateral
+
+        -- 3. Archive this repayment obligation and the original loan agreement,
+        -- as the loan lifecycle is now complete.
+        archive self
+        archive loanAgreementId
