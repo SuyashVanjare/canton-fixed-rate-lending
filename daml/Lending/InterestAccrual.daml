@@ -1,0 +1,88 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Lending.InterestAccrual where
+
+import Daml.Script
+import DA.Time (Time, addRelTime, relTime, seconds)
+import DA.Date as D
+import DA.Assert ((===), assertMsg)
+
+import Lending.LoanAgreement (LoanAgreement)
+
+-- | Represents the state of interest accrual for a specific loan agreement.
+-- This contract is created when a loan is finalized and is updated periodically
+-- by the operator to reflect accrued interest. It acts as the "heartbeat"
+to drive updates to the loan's outstanding balance.
+template InterestAccrual
+  with
+    operator : Party
+      -- ^ The party responsible for triggering the interest accrual process.
+    lender : Party
+      -- ^ The lender in the loan agreement.
+    borrower : Party
+      -- ^ The borrower in the loan agreement.
+    loanAgreementCid : ContractId LoanAgreement
+      -- ^ The associated loan agreement contract.
+    principal : Decimal
+      -- ^ The original principal amount of the loan.
+    annualInterestRate : Decimal
+      -- ^ The fixed annual interest rate (e.g., 0.05 for 5%).
+    interestAccrued : Decimal
+      -- ^ The total amount of interest accrued to date.
+    lastAccrualTimestamp : Time
+      -- ^ The timestamp of the last successful interest accrual.
+    nextAccrualTimestamp : Time
+      -- ^ The timestamp when the next accrual is scheduled to occur.
+    accrualPeriodSeconds : Int
+      -- ^ The period between accruals in seconds (e.g., 86400 for daily).
+  where
+    signatory operator, lender, borrower
+
+    key (operator, lender, borrower, loanAgreementCid) : (Party, Party, Party, ContractId LoanAgreement)
+    maintainer key._1
+
+    -- | Calculates and applies interest for the elapsed period.
+    -- This choice is typically called by an automated process (e.g., a trigger)
+    -- managed by the operator. It computes the interest owed since the last
+    -- accrual, updates the associated LoanAgreement, and recreates itself
+    -- with an advanced accrual schedule.
+    choice AccrueInterest : ContractId InterestAccrual
+      with
+        currentTime : Time
+          -- ^ The current ledger time, provided to ensure deterministic calculation.
+      controller operator
+      do
+        -- Ensure this choice is not called prematurely.
+        assertMsg "Accrual is not due yet" (currentTime >= nextAccrualTimestamp)
+
+        -- Fetch the loan agreement to update its state.
+        loan <- fetch loanAgreementCid
+        loan.borrower === borrower
+        loan.lender === lender
+
+        -- Calculate the time elapsed since the last accrual in years.
+        -- This is the basis for the simple interest calculation for this period.
+        let
+          timeDelta = relTime (currentTime `subTime` lastAccrualTimestamp)
+          secondsInYear = 31536000.0 -- 365 days * 24 hours * 60 minutes * 60 seconds
+          yearsElapsed = timeDelta / secondsInYear
+
+        -- Calculate interest for the current period.
+        let interestForPeriod = principal * annualInterestRate * yearsElapsed
+
+        -- Update the total amount owed on the master loan agreement contract.
+        -- This is a non-consuming choice on LoanAgreement.
+        exercise loanAgreementCid LoanAgreement_AddAccruedInterest with interestToAdd = interestForPeriod
+
+        -- Recreate the accrual contract with updated state for the next period.
+        create this with
+          interestAccrued = self.interestAccrued + interestForPeriod,
+          lastAccrualTimestamp = currentTime,
+          nextAccrualTimestamp = addRelTime currentTime (seconds (fromIntegral accrualPeriodSeconds))
+
+    -- | Allows the borrower or lender to view the current interest state.
+    nonconsuming choice GetAccrualDetails : InterestAccrual
+      controller borrower, lender
+      do
+        return self
