@@ -1,0 +1,129 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Lending.CollateralVault where
+
+import Daml.Script
+
+import Lending.LoanAgreement (LoanAgreement)
+-- NOTE: We assume a simple, project-specific Fungible token template exists
+-- that defines a transferable token. This would typically be replaced by a
+-- standard token library like the one specified in CIP-0056.
+import Lending.Token.Fungible (Fungible)
+
+-- | Represents collateral locked in a vault, backing a specific loan.
+-- This contract is created by consuming a `Fungible` token contract from the
+-- borrower, effectively locking the value. The choices on this contract will
+-- re-create the `Fungible` token contract for either the borrower (on reclaim)
+-- or the lender (on seizure), effectively unlocking the value.
+template CollateralVault
+  with
+    borrower: Party
+      -- ^ The owner of the collateral.
+    lender: Party
+      -- ^ The counterparty who can seize the collateral in case of default.
+    assetIssuer: Party
+      -- ^ The issuer of the collateral asset. Required to re-create the token.
+    assetSymbol: Text
+      -- ^ The symbol of the collateral asset.
+    quantity: Decimal
+      -- ^ The amount of collateral locked in the vault.
+    loanAgreementCid: ContractId LoanAgreement
+      -- ^ The loan agreement this collateral is backing.
+  where
+    signatory borrower
+    observer lender
+
+    key (borrower, loanAgreementCid) : (Party, ContractId LoanAgreement)
+    maintainer key._1
+
+    ensure quantity > 0.0
+
+    -- | Choice for the lender to seize the collateral.
+    -- This is intended to be called by the `LoanAgreement` contract as part of a
+    -- liquidation workflow. It creates a new `Fungible` token for the lender.
+    choice SeizeCollateral : ContractId Fungible
+      controller lender
+      do
+        -- Create a new Fungible token contract representing the collateral and
+        -- assign it to the lender.
+        newFungibleCid <- create Fungible with
+          issuer = assetIssuer
+          owner = lender
+          symbol = assetSymbol
+          quantity = quantity
+
+        -- Archive the vault as its purpose is fulfilled.
+        archive self
+
+        return newFungibleCid
+
+    -- | Choice for the borrower to reclaim their collateral.
+    -- This is intended to be called by the `LoanAgreement` contract after the
+    -- loan has been fully repaid. It creates a new `Fungible` token for the borrower.
+    choice ReclaimCollateral : ContractId Fungible
+      controller borrower
+      do
+        -- Create a new Fungible token contract representing the collateral and
+        -- return it to the borrower.
+        newFungibleCid <- create Fungible with
+          issuer = assetIssuer
+          owner = borrower
+          symbol = assetSymbol
+          quantity = quantity
+
+        -- Archive the vault as its purpose is fulfilled.
+        archive self
+
+        return newFungibleCid
+
+-- | A proposal to create a collateral vault by locking a fungible asset.
+-- The borrower creates this to offer a specific token contract as collateral
+-- for a loan agreement. The lender's acceptance atomically locks the token
+-- and creates the `CollateralVault`.
+template CollateralVaultProposal
+  with
+    borrower: Party
+      -- ^ The party proposing to lock collateral.
+    lender: Party
+      -- ^ The party for whose benefit the collateral is being locked.
+    collateralToLockCid : ContractId Fungible
+      -- ^ The specific fungible contract the borrower is offering as collateral.
+    loanAgreementCid: ContractId LoanAgreement
+      -- ^ The loan agreement the collateral will back.
+  where
+    signatory borrower
+    observer lender
+
+    key (borrower, lender, loanAgreementCid) : (Party, Party, ContractId LoanAgreement)
+    maintainer key._1
+
+    -- | The lender's choice to accept the collateral and create the vault.
+    -- This action is atomic: the provided fungible token is consumed and the
+    -- `CollateralVault` is created in a single transaction.
+    choice AcceptLockCollateral : ContractId CollateralVault
+      controller lender
+      do
+        -- Fetch the details from the fungible token contract.
+        collateral <- fetch collateralToLockCid
+        assertMsg "Collateral must be owned by the borrower" (collateral.owner == borrower)
+
+        -- Create the vault, which now represents the locked asset.
+        vaultCid <- create CollateralVault with
+          borrower = borrower
+          lender = lender
+          assetIssuer = collateral.issuer
+          assetSymbol = collateral.symbol
+          quantity = collateral.quantity
+          loanAgreementCid = loanAgreementCid
+
+        -- Consume the original fungible token contract, completing the lock.
+        archive collateralToLockCid
+
+        return vaultCid
+
+    -- | The borrower's choice to withdraw the proposal before it is accepted.
+    choice WithdrawProposal : ()
+      controller borrower
+      do
+        archive self
