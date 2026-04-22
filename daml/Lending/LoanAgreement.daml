@@ -1,131 +1,130 @@
--- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
 module Lending.LoanAgreement where
 
-import DA.Date
-import DA.Time
-import DA.Assert
+import Daml.Script
+import DA.Date as Date
+import DA.Time (Time)
+import DA.Optional (isSome)
+import Lending.CollateralVault qualified as CollateralVault (CollateralVault)
 
--- | Represents an active, matched loan between a borrower and a lender.
--- This contract is created when a `LoanRequest` and `LoanOffer` are successfully
--- matched by the market `operator`. It locks in the principal, interest rate,
--- and maturity for the duration of the loan. The `repaymentAmount` is
--- pre-calculated to ensure a fixed, deterministic liability for the borrower.
+-- | Represents the core bilateral agreement for a fixed-rate loan.
+-- This contract is created after the loan is funded and collateral is locked.
+-- It serves as the source of truth for the loan's terms throughout its lifecycle.
+-- It includes an early repayment fee clause, which applies if the borrower
+-- settles the loan before the agreed maturity date.
 template LoanAgreement
   with
+    operator: Party
+      -- ^ The operator of the lending platform, responsible for lifecycle management.
     loanId: Text
-      -- ^ A unique identifier for the loan agreement.
+      -- ^ A unique identifier for the loan.
     borrower: Party
-      -- ^ The party who has borrowed the principal and posted collateral.
+      -- ^ The party borrowing the funds.
     lender: Party
-      -- ^ The party who has lent the principal.
-    operator: Party
-      -- ^ The market operator, who facilitates matching and may mediate defaults.
+      -- ^ The party lending the funds.
+    currency: Text
+      -- ^ The currency of the loan (e.g., "USDc").
     principal: Decimal
-      -- ^ The initial amount of currency lent to the borrower.
-    repaymentAmount: Decimal
-      -- ^ The total fixed amount (principal + interest) to be repaid by the borrower at maturity.
-    interestRate: Decimal
-      -- ^ The agreed annual percentage rate (APR) for the loan.
-    collateralAmount: Decimal
-      -- ^ The quantity of the collateral asset locked for this loan.
-    collateralAsset: Text
-      -- ^ An identifier for the collateral asset (e.g., ISIN, CUSIP for a T-Bill).
-    startDate: Date
-      -- ^ The date the loan was initiated.
+      -- ^ The initial amount borrowed.
+    outstandingPrincipal: Decimal
+      -- ^ The current outstanding principal.
+    annualInterestRate: Decimal
+      -- ^ The fixed annual interest rate (e.g., 0.05 for 5%).
+    earlyRepaymentFeeRate: Decimal
+      -- ^ Fee as a percentage of *remaining interest* if repaid early (e.g., 0.10 for 10%).
+      -- This compensates the lender for the loss of expected yield.
     maturityDate: Date
-      -- ^ The final date by which the loan must be repaid.
+      -- ^ The date on which the loan is due.
+    issuanceDate: Date
+      -- ^ The date the loan was issued.
+    lastAccrualDate: Date
+      -- ^ The last date interest was accrued.
+    accruedInterest: Decimal
+      -- ^ Interest accrued but not yet paid.
+    collateralVaultCid: ContractId CollateralVault.CollateralVault
+      -- ^ A reference to the vault contract holding the loan's collateral.
+
   where
-    signatory borrower, lender, operator
+    signatory operator, borrower, lender
 
-    key (borrower, lender, loanId) : (Party, Party, Text)
-    maintainer key._1, key._2
-
-    ensure principal > 0.0
-      && repaymentAmount >= principal
-      && collateralAmount > 0.0
-      && maturityDate > startDate
-
-    -- | The borrower's choice to repay the loan in full. In a complete workflow,
-    -- this choice would be exercised atomically with the transfer of a payment
-    -- asset (e.g., a tokenized cash contract) from the borrower to the lender,
-    -- ensuring delivery-vs-payment. This choice's primary role is to correctly
-    -- terminate the loan agreement on the ledger upon successful settlement.
-    choice Repay : ()
-      controller borrower
-      do
-        now <- getTime
-        assertMsg
-          ("Repayment can only occur on or before the maturity date. " <> show maturityDate)
-          (toDateUTC now <= maturityDate)
-
-        -- Consuming this contract signifies the loan obligation is fulfilled.
-        -- The calling context (e.g., a Daml Script or UI-driven command) is
-        -- responsible for orchestrating the atomic transfer of `repaymentAmount`
-        -- from the borrower to the lender in the same transaction.
-        return ()
-
-    -- | The lender's choice to declare a default if the borrower fails to repay
-    -- the loan by the maturity date. This archives the agreement and creates a
-    -- `CollateralClaim` contract, giving the lender a formal, on-ledger right
-    -- to the borrower's collateral.
-    choice DeclareDefault : ContractId CollateralClaim
-      controller lender
-      do
-        now <- getTime
-        assertMsg
-          ("Default can only be declared after the maturity date. " <> show maturityDate)
-          (toDateUTC now > maturityDate)
-
-        create CollateralClaim with
-          loanId
-          originalBorrower = borrower
-          claimant = lender
-          operator
-          collateralAmount
-          collateralAsset
-          reason = "Failure to repay loan by maturity date: " <> show maturityDate
-
--- | Represents the lender's right to the collateral after a loan default.
--- This contract is created when a `LoanAgreement` is defaulted. The `operator`
--- is a signatory, as they are expected to facilitate the process of transferring
--- the underlying collateral asset to the `claimant` (the lender).
-template CollateralClaim
-  with
-    loanId: Text
-      -- ^ The ID of the defaulted loan.
-    originalBorrower: Party
-      -- ^ The party who defaulted and whose collateral is being claimed.
-    claimant: Party
-      -- ^ The lender who now has a claim on the collateral.
-    operator: Party
-      -- ^ The market operator responsible for facilitating settlement of the claim.
-    collateralAmount: Decimal
-      -- ^ The amount of collateral being claimed.
-    collateralAsset: Text
-      -- ^ The identifier of the collateral asset.
-    reason: Text
-      -- ^ The reason for the default.
-  where
-    signatory claimant, operator
-    observer originalBorrower
-
-    key (claimant, loanId) : (Party, Text)
+    key (operator, loanId) : (Party, Text)
     maintainer key._1
 
-    -- | Allows stakeholders to view the details of the collateral claim.
-    nonconsuming choice GetClaimDetails : (Decimal, Text, Text)
-      controller claimant, operator, originalBorrower
-      do
-        return (collateralAmount, collateralAsset, reason)
+    ensure
+      principal > 0.0 &&
+      annualInterestRate >= 0.0 &&
+      outstandingPrincipal > 0.0 &&
+      outstandingPrincipal <= principal &&
+      accruedInterest >= 0.0 &&
+      maturityDate > issuanceDate &&
+      lastAccrualDate >= issuanceDate &&
+      lastAccrualDate <= maturityDate &&
+      earlyRepaymentFeeRate >= 0.0 && earlyRepaymentFeeRate <= 1.0
 
-    -- | Operator's choice to confirm that the collateral has been settled off-ledger
-    -- or via another on-ledger mechanism. This archives the claim, completing the
-    -- default resolution process on the ledger.
-    choice ConfirmSettlement : ()
+    -- | Calculates the total amount due for repayment on a given date.
+    -- This includes outstanding principal, accrued interest, and any applicable
+    -- early repayment fee. The calculation of the fee is encapsulated here.
+    nonconsuming choice CalculateRepaymentAmount : (Decimal, Decimal)
+      with
+        repaymentDate: Date
+      controller borrower, lender, operator
+      do
+        assertMsg "Repayment date must be on or after last accrual date"
+          (repaymentDate >= lastAccrualDate)
+
+        let totalOutstanding = outstandingPrincipal + accruedInterest
+
+        if repaymentDate < maturityDate then do
+          -- Calculate the interest that *would have* accrued from the repayment
+          -- date until maturity on the current outstanding principal.
+          -- This represents the lender's lost yield.
+          let daysRemaining = Date.daysBetween maturityDate repaymentDate
+          -- Using a simple ACT/365 day count convention.
+          let dailyRate = annualInterestRate / 365.0
+          let remainingInterest = outstandingPrincipal * dailyRate * (intToDecimal daysRemaining)
+
+          -- The fee is a percentage of this lost yield.
+          let fee = remainingInterest * earlyRepaymentFeeRate
+          return (totalOutstanding + fee, fee)
+        else
+          -- No fee is charged for repayment on or after the maturity date.
+          return (totalOutstanding, 0.0)
+
+    -- | Updates the loan state after an interest accrual event. This is typically
+    -- called by an automated trigger based on the system's accrual schedule.
+    choice UpdateAccrual : ContractId LoanAgreement
+      with
+        newAccruedInterest: Decimal
+        newLastAccrualDate: Date
       controller operator
       do
-        return ()
+        assertMsg "New last accrual date must be after the current one"
+          (newLastAccrualDate > lastAccrualDate)
+        assertMsg "New last accrual date cannot be after maturity"
+          (newLastAccrualDate <= maturityDate)
+        assertMsg "New accrued interest must not be negative"
+          (newAccruedInterest >= 0.0)
+
+        create this with
+          accruedInterest = newAccruedInterest
+          lastAccrualDate = newLastAccrualDate
+
+    -- | Reflects a principal reduction on the loan agreement.
+    -- This choice archives the current state and creates a new one with the
+    -- reduced principal amount. It is intended to be called within the context
+    -- of a larger repayment workflow which handles the payment itself.
+    choice ReducePrincipalAndResetInterest : ContractId LoanAgreement
+      with
+        principalReduction: Decimal
+      controller operator
+      do
+        assertMsg "Principal reduction amount must be positive"
+          (principalReduction > 0.0)
+        assertMsg "Principal reduction cannot exceed outstanding principal"
+          (principalReduction <= outstandingPrincipal)
+
+        create this with
+          outstandingPrincipal = outstandingPrincipal - principalReduction
+          accruedInterest = 0.0 -- Assume interest is paid off with any principal payment.
